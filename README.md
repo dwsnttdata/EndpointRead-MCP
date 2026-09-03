@@ -6,6 +6,10 @@ EndpointRead-MCP is a safe, non-destructive Graph MCP surface that supports
 list/get/search/reporting operations only. It is designed for tenant visibility,
 audits, troubleshooting, and health reporting without write actions.
 
+## Developed By
+
+Sujin Nelladath
+
 ## Key Features
 
 - Read-only Intune and Entra operations.
