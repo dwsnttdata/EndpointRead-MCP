@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'EndpointRead-MCP-DataHub'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_0D4EFADD814D46C1A97DA7F9A76DBA53 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_C87D5B5B3EDB4719B5D2B4093BF47802 }}
