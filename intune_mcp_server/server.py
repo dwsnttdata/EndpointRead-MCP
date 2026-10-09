@@ -23,6 +23,7 @@ if __name__ == "__main__":
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import ToolAnnotations
 
 from intune_mcp_server.config import get_config  # noqa: F401  (ensures .env is loaded)
 from intune_mcp_server.graph_client import AuthRequiredError, get_graph_client
@@ -63,6 +64,28 @@ mcp = FastMCP(
     stateless_http=True,
     transport_security=_transport_security(),
 )
+
+# Optional comma-separated tool allowlist; empty means every tool is exposed.
+_ENABLED_TOOLS = {t.strip() for t in os.getenv("MCP_ENABLED_TOOLS", "").split(",") if t.strip()}
+# Optional cap (seconds) on report export polling; 0 keeps each call's own timeout.
+_EXPORT_TIMEOUT_CAP = int(os.getenv("REPORT_EXPORT_TIMEOUT_SECONDS", "0") or 0)
+
+
+def _tool():
+    """Register a tool as read-only, unless MCP_ENABLED_TOOLS excludes it."""
+    def decorator(fn):
+        if _ENABLED_TOOLS and fn.__name__ not in _ENABLED_TOOLS:
+            return fn
+        title = fn.__name__.removeprefix("manage_").replace("_", " ").title() + " (Read-only)"
+        annotations = ToolAnnotations(
+            title=title,
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        )
+        return mcp.tool(title=title, annotations=annotations)(fn)
+    return decorator
 
 
 def main() -> None:
@@ -159,6 +182,9 @@ async def _run_export_job(
     if select:
         body["select"] = select
 
+    if _EXPORT_TIMEOUT_CAP > 0:
+        timeout_seconds = min(timeout_seconds, _EXPORT_TIMEOUT_CAP)
+
     job = await c.post("/deviceManagement/reports/exportJobs", use_beta=True, json=body)
     job_id = job.get("id")
     if not job_id:
@@ -178,7 +204,12 @@ async def _run_export_job(
         if status in {"failed", "cancelled", "error"}:
             return {"error": f"Export job for '{report_name}' {status}.", "details": job_status}
     else:
-        return {"error": f"Export job for '{report_name}' timed out after {timeout_seconds}s.", "job_id": job_id}
+        return {
+            "status": "report_generating",
+            "error": f"Export job for '{report_name}' timed out after {timeout_seconds}s.",
+            "message": "Intune is still generating this report. No data was returned; try again in a few minutes.",
+            "job_id": job_id,
+        }
 
     download_url = job_status.get("url")
     if not download_url:
@@ -217,7 +248,7 @@ async def _run_export_job(
 # ===========================================================================
 # TOOL 1 — Connection & Health
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def authenticate_mcp_session() -> dict[str, Any]:
     """Authenticate the MCP session using the configured .env sign-in flow."""
     c = get_graph_client()
@@ -238,7 +269,7 @@ async def authenticate_mcp_session() -> dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
 
-@mcp.tool()
+@_tool()
 async def test_connection() -> dict[str, Any]:
     """Test the connection to Microsoft Graph API and return tenant information."""
     try:
@@ -261,7 +292,7 @@ async def test_connection() -> dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
 
-@mcp.tool()
+@_tool()
 async def get_auth_status() -> dict[str, Any]:
     """Get current authentication mode and sign-in/cache status."""
     c = get_graph_client()
@@ -274,27 +305,27 @@ async def get_auth_status() -> dict[str, Any]:
     return await c.get_auth_status()
 
 
-@mcp.tool()
+@_tool()
 async def start_interactive_sign_in() -> dict[str, Any]:
     """Start user sign-in flow (device code) and return sign-in instructions."""
     c = get_graph_client()
     return await c.start_interactive_sign_in()
 
 
-@mcp.tool()
+@_tool()
 async def complete_interactive_sign_in() -> dict[str, Any]:
     """Complete user sign-in flow after user enters device code."""
     c = get_graph_client()
     return await c.complete_interactive_sign_in()
 
 
-@mcp.tool()
+@_tool()
 async def complete_interactive_login() -> dict[str, Any]:
     """Compatibility wrapper that completes the interactive sign-in flow for the MCP session."""
     return await complete_interactive_sign_in()
 
 
-@mcp.tool()
+@_tool()
 async def connect_intune_mcp_server() -> dict[str, Any]:
     """One-step connection flow: trigger sign-in if needed, then verify Graph connectivity."""
     c = get_graph_client()
@@ -346,7 +377,7 @@ async def connect_intune_mcp_server() -> dict[str, Any]:
 # ===========================================================================
 # TOOL 2 — Intune Overview
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def get_intune_overview() -> dict[str, Any]:
     """Return device counts, compliance distribution and OS breakdown for the tenant."""
     c = get_graph_client()
@@ -366,7 +397,7 @@ async def get_intune_overview() -> dict[str, Any]:
 # ===========================================================================
 # TOOL 3 — Intune Managed Devices
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_intune_devices(
     action: str,
     device_id: str = "",
@@ -379,7 +410,7 @@ async def manage_intune_devices(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune managed devices. All device lifecycle and action operations.
+    Read-only: view Intune managed devices, inventory and compliance state.
 
     action values:
       list            — List all managed devices (supports filter_query, top)
@@ -392,23 +423,6 @@ async def manage_intune_devices(
       get_installed_apps — Apps detected on a device (device_id)
       get_compliance_states — Compliance policy states for a device (device_id)
       get_log_requests — Diagnostic log collection requests for a device (device_id)
-      sync            — Trigger sync on a device (device_id)
-      bulk_sync       — Sync a list of devices (body: {device_ids: [...]})
-      restart         — Restart a device remotely (device_id)
-      lock            — Remote lock a device (device_id)
-      rename          — Rename a device (device_id, body: {deviceName: "..."})
-      locate          — Trigger GPS location on a device (device_id)
-      reset_passcode  — Reset passcode on iOS/Android (device_id)
-      bypass_activation_lock — Bypass iOS Activation Lock (device_id)
-      enable_lost_mode   — Enable iOS Lost Mode (device_id, body: {message,phoneNumber,footer})
-      disable_lost_mode  — Disable iOS Lost Mode (device_id)
-      collect_diagnostics— Collect device diagnostics/logs (device_id)
-      defender_scan   — Trigger Windows Defender scan (device_id, body: {quickScan: true/false})
-      defender_update_signatures — Update Defender signatures (device_id)
-      clean_device    — Clean Windows device; body: {keepUserData: bool} (device_id, confirm=True)
-      delete          — Delete device from Intune (device_id, confirm=True)
-      wipe            — Factory reset / wipe device (device_id, confirm=True)
-      retire          — Retire device / remove company data (device_id, confirm=True)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -549,14 +563,14 @@ async def manage_intune_devices(
 # ===========================================================================
 # TOOL 4 — Device Encryption & BitLocker
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_device_encryption(
     action: str,
     device_id: str = "",
     key_id: str = "",
 ) -> dict[str, Any]:
     """
-    Manage device encryption keys and reports.
+    Read-only: view device encryption keys and reports.
 
     action values:
       list_bitlocker_keys — List all BitLocker recovery keys for the tenant
@@ -595,7 +609,7 @@ async def manage_device_encryption(
 # ===========================================================================
 # TOOL 5 — Intune App Management
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_intune_apps(
     action: str,
     app_id: str = "",
@@ -606,17 +620,12 @@ async def manage_intune_apps(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune mobile apps — full CRUD, search, assignments and install status.
+    Read-only: view Intune mobile apps, assignments and install status.
 
     action values:
       list            — List all mobile apps (top)
       get             — Get app details + assignments (app_id)
       search          — Search apps by display name (search_term)
-      create          — Create/register a new app (body)
-      update          — Update app metadata (app_id, body)
-      delete          — Delete an app (app_id, confirm=True)
-      assign          — Assign app to groups (app_id, body: {assignments:[...]})
-      remove_assignment — Remove one assignment (app_id, assignment_id, confirm=True)
       get_install_status — Get app install summary (app_id)
       list_discovered — List all apps discovered across managed devices
       get_mam_registrations — List managed app registrations (MAM enrollment)
@@ -694,7 +703,7 @@ async def manage_intune_apps(
 # ===========================================================================
 # TOOL 6 — App Config & MAM Policies
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_app_config_mam(
     action: str,
     policy_id: str = "",
@@ -704,18 +713,12 @@ async def manage_app_config_mam(
     platform: str = "ios",
 ) -> dict[str, Any]:
     """
-    Manage app configuration policies and MAM (app protection) policies.
+    Read-only: view app configuration policies and MAM (app protection) policies.
 
     action values:
       list_config_policies   — List all managed app config policies (targeted)
       get_config_policy      — Get a specific app config policy (policy_id)
-      create_config_policy   — Create an app config policy (body)
-      update_config_policy   — Update an app config policy (policy_id, body)
-      delete_config_policy   — Delete an app config policy (policy_id, confirm=True)
       list_protection_policies — List MAM/app protection policies
-      create_protection_policy — Create an app protection policy (platform: ios|android, body)
-      update_protection_policy — Update an app protection policy (policy_id, platform, body)
-      delete_protection_policy — Delete an app protection policy (policy_id, platform, confirm=True)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -771,7 +774,7 @@ async def manage_app_config_mam(
 # ===========================================================================
 # TOOL 7 — Compliance Policies
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_compliance_policies(
     action: str,
     policy_id: str = "",
@@ -780,15 +783,11 @@ async def manage_compliance_policies(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune device compliance policies — CRUD, assignment and status.
+    Read-only: view Intune device compliance policies, assignments and status.
 
     action values:
       list        — List all compliance policies
       get         — Get compliance policy details (policy_id)
-      create      — Create a new compliance policy (body)
-      update      — Update a compliance policy (policy_id, body)
-      delete      — Delete a compliance policy (policy_id, confirm=True)
-      assign      — Assign policy to groups (policy_id, body: {assignments:[...]})
       get_status  — Get device deployment status for a policy (policy_id)
       list_assignments — List assignments for a policy (policy_id)
     """
@@ -840,7 +839,7 @@ async def manage_compliance_policies(
 # ===========================================================================
 # TOOL 8 — Configuration Profiles
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_configuration_profiles(
     action: str,
     profile_id: str = "",
@@ -849,15 +848,11 @@ async def manage_configuration_profiles(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune device configuration profiles — CRUD, assignment and status.
+    Read-only: view Intune device configuration profiles, assignments and status.
 
     action values:
       list        — List all configuration profiles
       get         — Get profile details (profile_id)
-      create      — Create a new profile (body)
-      update      — Update a profile (profile_id, body)
-      delete      — Delete a profile (profile_id, confirm=True)
-      assign      — Assign profile to groups (profile_id, body: {assignments:[...]})
       get_status  — Get device deployment status (profile_id)
       list_assignments — List assignments (profile_id)
     """
@@ -909,7 +904,7 @@ async def manage_configuration_profiles(
 # ===========================================================================
 # TOOL 9 — Settings Catalog
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_settings_catalog(
     action: str,
     policy_id: str = "",
@@ -918,15 +913,11 @@ async def manage_settings_catalog(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune settings catalog configuration policies.
+    Read-only: view Intune settings catalog configuration policies.
 
     action values:
       list    — List all settings catalog policies
       get     — Get policy details (policy_id)
-      create  — Create a settings catalog policy (body)
-      update  — Update a settings catalog policy (policy_id, body)
-      delete  — Delete a policy (policy_id, confirm=True)
-      assign  — Assign policy to groups (policy_id, body: {assignments:[...]})
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -968,7 +959,7 @@ async def manage_settings_catalog(
 # ===========================================================================
 # TOOL 10 — ADMX / Group Policy Configurations
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_admx_policies(
     action: str,
     config_id: str = "",
@@ -977,13 +968,11 @@ async def manage_admx_policies(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune ADMX (Administrative Templates / Group Policy) configurations.
+    Read-only: view Intune ADMX (Administrative Templates / Group Policy) configurations.
 
     action values:
       list    — List all ADMX configurations
       get     — Get ADMX config details (config_id)
-      create  — Create an ADMX configuration (body)
-      delete  — Delete an ADMX configuration (config_id, confirm=True)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -1019,7 +1008,7 @@ async def manage_admx_policies(
 # ===========================================================================
 # TOOL 11 — Endpoint Security
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_endpoint_security(
     action: str,
     policy_id: str = "",
@@ -1029,15 +1018,11 @@ async def manage_endpoint_security(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune endpoint security policies (Antivirus, Firewall, EDR, etc.).
+    Read-only: view Intune endpoint security policies (Antivirus, Firewall, EDR, etc.).
 
     action values:
       list_policies     — List all endpoint security policies
       get_policy        — Get policy details (policy_id)
-      create_policy     — Create from a template (template_id, body)
-      update_policy     — Update an endpoint security policy (policy_id, body)
-      delete_policy     — Delete a policy (policy_id, confirm=True)
-      assign_policy     — Assign to groups (policy_id, body: {assignments:[...]})
       get_policy_status — Device state summary for a policy (policy_id)
       list_templates    — List all security templates
     """
@@ -1087,7 +1072,7 @@ async def manage_endpoint_security(
 # ===========================================================================
 # TOOL 12 — Security Baselines
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_security_baselines(
     action: str,
     profile_id: str = "",
@@ -1129,7 +1114,7 @@ async def manage_security_baselines(
 # ===========================================================================
 # TOOL 13 — Windows Update Policies
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_windows_update(
     action: str,
     policy_id: str = "",
@@ -1138,17 +1123,13 @@ async def manage_windows_update(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Windows Update rings and feature/quality/driver update profiles.
+    Read-only: view Windows Update rings and feature/quality/driver update profiles.
 
     action values:
       list_update_rings       — List all Windows update rings
       get_update_ring         — Get update ring details (policy_id)
-      create_update_ring      — Create an update ring (body)
-      update_update_ring      — Modify an update ring (policy_id, body)
-      delete_update_ring      — Delete an update ring (policy_id, confirm=True)
       list_feature_updates    — List Windows feature update profiles
       get_feature_update      — Get a feature update profile (policy_id)
-      create_feature_update   — Create a feature update profile (body)
       list_quality_updates    — List quality/expedite update policies
       list_driver_updates     — List driver update profiles
     """
@@ -1206,7 +1187,7 @@ async def manage_windows_update(
 # ===========================================================================
 # TOOL 14 — Intune Scripts & Remediations
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_intune_scripts(
     action: str,
     script_id: str = "",
@@ -1216,17 +1197,13 @@ async def manage_intune_scripts(
     script_type: str = "powershell",
 ) -> dict[str, Any]:
     """
-    Manage Intune PowerShell scripts, proactive remediations and macOS shell scripts.
+    Read-only: view Intune PowerShell scripts, proactive remediations and macOS shell scripts.
 
     script_type: powershell | remediation | macos
 
     action values:
       list     — List scripts (script_type)
       get      — Get script details (script_id, script_type)
-      create   — Upload a new script (body, script_type)
-      update   — Update a script (script_id, body, script_type)
-      delete   — Delete a script (script_id, script_type, confirm=True)
-      assign   — Assign a script to groups (script_id, body, script_type)
       get_status — Device run states for a script (script_id, script_type)
     """
     c = get_graph_client()
@@ -1279,7 +1256,7 @@ async def manage_intune_scripts(
 # ===========================================================================
 # TOOL 15 — Enrollment
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_intune_enrollment(
     action: str,
     config_id: str = "",
@@ -1289,19 +1266,13 @@ async def manage_intune_enrollment(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune enrollment restrictions, Apple VPP/DEP tokens, and Android Enterprise.
+    Read-only: view Intune enrollment restrictions, Apple VPP/DEP tokens, and Android Enterprise.
 
     action values:
       list_restrictions      — List device enrollment configurations/restrictions
-      create_restriction     — Create an enrollment restriction (body)
-      update_restriction     — Update an enrollment restriction (config_id, body)
-      delete_restriction     — Delete a restriction (config_id, confirm=True)
-      assign_restriction     — Assign restriction to groups (config_id, body)
       list_vpp_tokens        — List Apple VPP tokens
       get_vpp_token          — Get a VPP token (token_id)
-      sync_vpp_token         — Sync a VPP token (token_id)
       list_dep_tokens        — List Apple DEP/ADE onboarding settings
-      sync_dep_token         — Sync a DEP/ADE token (token_id)
       list_android_enterprise — List Android Enterprise account settings
       get_failures_report    — Export enrollment failures report
       list_dep_profiles      — List enrollment profiles for a DEP token (token_id)
@@ -1371,7 +1342,7 @@ async def manage_intune_enrollment(
 # ===========================================================================
 # TOOL 16 — Autopilot
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_autopilot(
     action: str,
     device_id: str = "",
@@ -1381,18 +1352,12 @@ async def manage_autopilot(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Windows Autopilot devices and deployment profiles.
+    Read-only: view Windows Autopilot devices, deployment profiles and deployment status.
 
     action values:
       list_devices         — List all Autopilot device identities
       list_profiles        — List all Autopilot deployment profiles
       get_profile          — Get profile details (profile_id)
-      create_profile       — Create an Autopilot deployment profile (body)
-      update_profile       — Update a profile (profile_id, body)
-      delete_profile       — Delete a profile (profile_id, confirm=True)
-      assign_profile       — Assign profile to device/group (profile_id, body)
-      import_device        — Import via hardware hash (body: {serialNumber,...})
-      delete_device        — Delete Autopilot device registration (device_id, confirm=True)
       get_deployment_status — Autopilot deployment events
       list_esp_profiles    — List Enrollment Status Page profiles
     """
@@ -1461,7 +1426,7 @@ async def manage_autopilot(
 # ===========================================================================
 # TOOL 17 — Filters & Scope Tags
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_filters_tags(
     action: str,
     filter_id: str = "",
@@ -1471,17 +1436,12 @@ async def manage_filters_tags(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune assignment filters and scope tags.
+    Read-only: view Intune assignment filters and scope tags.
 
     action values:
       list_filters   — List all assignment filters
       get_filter     — Get filter details (filter_id)
-      create_filter  — Create an assignment filter (body)
-      update_filter  — Update a filter (filter_id, body)
-      delete_filter  — Delete a filter (filter_id, confirm=True)
       list_tags      — List all scope tags
-      create_tag     — Create a scope tag (body)
-      delete_tag     — Delete a scope tag (tag_id, confirm=True)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -1533,7 +1493,7 @@ async def manage_filters_tags(
 # ===========================================================================
 # TOOL 18 — Intune RBAC
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_intune_rbac(
     action: str,
     role_id: str = "",
@@ -1543,18 +1503,12 @@ async def manage_intune_rbac(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Intune RBAC role definitions and role assignments.
+    Read-only: view Intune RBAC role definitions and role assignments.
 
     action values:
       list_roles         — List all role definitions (built-in + custom)
       get_role           — Get role definition details (role_id)
-      create_role        — Create a custom role (body)
-      update_role        — Update a custom role (role_id, body)
-      delete_role        — Delete a custom role (role_id, confirm=True)
       list_assignments   — List all role assignments
-      create_assignment  — Assign role to user/group with scope (body)
-      delete_assignment  — Remove a role assignment (assignment_id, confirm=True)
-      list_resource_operations — List all available RBAC resource actions (permission strings)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -1610,7 +1564,7 @@ async def manage_intune_rbac(
 # ===========================================================================
 # TOOL 19 — Windows 365 Cloud PC
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_cloud_pc(
     action: str,
     cloud_pc_id: str = "",
@@ -1621,22 +1575,15 @@ async def manage_cloud_pc(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Windows 365 Cloud PCs, provisioning policies and network connections.
+    Read-only: view Windows 365 Cloud PCs, provisioning policies and network connections.
 
     action values:
       list            — List all Cloud PCs
       get             — Get Cloud PC details (cloud_pc_id)
       get_overview    — Cloud PC overview/summary
-      restart         — Restart a Cloud PC (cloud_pc_id)
-      reprovision     — Reprovision a Cloud PC (cloud_pc_id, confirm=True)
-      resize          — Resize/upgrade a Cloud PC (cloud_pc_id, body: {targetServicePlanId})
-      restore         — Restore from snapshot (cloud_pc_id, body: {snapshotId})
-      troubleshoot    — Trigger troubleshoot action (cloud_pc_id)
       list_snapshots  — List available snapshots (cloud_pc_id)
       get_audit_events — Audit event logs
       list_provisioning_policies — List provisioning policies
-      create_provisioning_policy — Create a provisioning policy (body)
-      assign_provisioning_policy — Assign policy to groups (policy_id, body)
       list_gallery_images   — List gallery images for provisioning
       list_connections      — List Azure network connections
     """
@@ -1721,7 +1668,7 @@ async def manage_cloud_pc(
 # ===========================================================================
 # TOOL 20 — Entra ID Users
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_entra_users(
     action: str,
     user_id: str = "",
@@ -1731,34 +1678,18 @@ async def manage_entra_users(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Entra ID users — full lifecycle including licenses, manager, onboarding and offboarding.
+    Read-only: view Entra ID users, their devices, licenses, reports and group memberships.
 
     action values:
       list               — List all users (top)
       get                — Get user details (user_id or UPN)
       search             — Search users by displayName (search_term)
-      create             — Create a new user (body)
-      update             — Update user properties (user_id, body)
-      delete             — Delete a user (user_id, confirm=True)
-      enable             — Enable user account (user_id)
-      disable            — Disable/block user sign-in (user_id)
-      reset_password     — Reset user password (user_id, body: {newPassword, forceChangeAtNextSignIn})
-      revoke_sessions    — Revoke all user refresh tokens (user_id)
       get_devices        — List managed devices for a user (user_id)
       get_licenses       — Get license assignments (user_id)
-      assign_license     — Assign a license (user_id, body: {addLicenses:[{skuId}], removeLicenses:[]})
-      remove_license     — Remove a license (user_id, body: {addLicenses:[], removeLicenses:[skuId]})
       list_available_licenses — List available license SKUs in tenant
       get_deleted_users  — List recently deleted users
-      restore_user       — Restore a deleted user (user_id)
-      assign_manager     — Set user's manager (user_id, body: {"@odata.id": managerUrl})
-      remove_manager     — Remove user's manager (user_id)
       get_direct_reports — List user's direct reports (user_id)
       get_member_groups  — List groups the user belongs to (user_id)
-      onboard_user       — Full onboard: create + manager + license + group membership (body)
-      offboard_user      — Full offboard: disable + revoke sessions + remove groups (user_id, confirm=True)
-      bulk_create        — Create multiple users from a list (body: {users: [...]})
-      bulk_assign_license — Assign license to multiple users (body: {user_ids:[...], skuId:...})
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -1920,7 +1851,7 @@ async def manage_entra_users(
 # ===========================================================================
 # TOOL 21 — Entra ID Groups
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_entra_groups(
     action: str,
     group_id: str = "",
@@ -1931,23 +1862,14 @@ async def manage_entra_groups(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Entra ID groups — full CRUD plus membership and ownership operations.
+    Read-only: view Entra ID groups, members and owners.
 
     action values:
       list            — List all groups
       get             — Get group details (group_id)
       search          — Search groups by displayName (search_term)
-      create_security — Create a security group (body: {displayName, description})
-      create_m365     — Create a Microsoft 365 group (body)
-      create_dynamic  — Create a dynamic security group (body: includes membershipRule)
-      update          — Update group properties (group_id, body)
-      delete          — Delete a group (group_id, confirm=True)
       get_members     — List group members (group_id)
-      add_member      — Add a member (group_id, member_id)
-      remove_member   — Remove a member (group_id, member_id)
       get_owners      — List group owners (group_id)
-      add_owner       — Add an owner (group_id, member_id)
-      bulk_add_members — Add multiple members (group_id, body: {member_ids:[...]})
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -2038,7 +1960,7 @@ async def manage_entra_groups(
 # ===========================================================================
 # TOOL 22 — Entra ID Devices
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_entra_devices(
     action: str,
     device_id: str = "",
@@ -2048,17 +1970,12 @@ async def manage_entra_devices(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Entra ID device objects (separate from Intune managed devices).
+    Read-only: view Entra ID device objects (separate from Intune managed devices).
 
     action values:
       list          — List all Entra ID devices
       get           — Get device details (device_id)
       search        — Search by displayName (search_term)
-      enable        — Enable a device in Entra ID (device_id)
-      disable       — Disable a device in Entra ID (device_id)
-      delete_entra  — Delete device from Entra ID (device_id, confirm=True)
-      delete_intune — Delete device from Intune (intune_device_id, confirm=True)
-      delete_both   — Delete from both Intune and Entra (device_id + intune_device_id, confirm=True)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -2122,7 +2039,7 @@ async def manage_entra_devices(
 # ===========================================================================
 # TOOL 23 — Conditional Access
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_conditional_access(
     action: str,
     policy_id: str = "",
@@ -2132,20 +2049,12 @@ async def manage_conditional_access(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Entra ID Conditional Access policies and named locations.
+    Read-only: view Entra ID Conditional Access policies and named locations.
 
     action values:
       list_policies    — List all CA policies
       get_policy       — Get CA policy details (policy_id)
-      create_policy    — Create a new CA policy (body)
-      update_policy    — Update a CA policy (policy_id, body)
-      delete_policy    — Delete a CA policy (policy_id, confirm=True)
-      enable_policy    — Enable a CA policy (policy_id)
-      disable_policy   — Disable a CA policy (policy_id)
       list_locations   — List named locations
-      create_location  — Create a named location (body)
-      update_location  — Update a named location (location_id, body)
-      delete_location  — Delete a named location (location_id, confirm=True)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -2212,7 +2121,7 @@ async def manage_conditional_access(
 # ===========================================================================
 # TOOL 24 — Identity Protection & Authentication
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_identity_protection(
     action: str,
     user_id: str = "",
@@ -2222,19 +2131,16 @@ async def manage_identity_protection(
     filter_query: str = "",
 ) -> dict[str, Any]:
     """
-    Manage identity protection, authentication methods, sign-in logs and risky users.
+    Read-only: view identity protection, authentication methods, sign-in logs and risky users.
 
     action values:
       get_auth_methods         — List authentication methods for a user (user_id)
       get_mfa_status           — Check MFA registration status for a user (user_id)
-      delete_auth_method       — Remove an authentication method (user_id, method_id, confirm=True)
       get_auth_methods_policy  — Get tenant-wide authentication methods policy
       get_sign_in_logs         — Sign-in logs (filter_query for OData filter, top)
       get_directory_audit_logs — Directory audit logs (filter_query, top)
       get_risky_users          — List risky users
       get_risk_detections      — Get risk detection events
-      dismiss_risky_user       — Dismiss risk for a user (body: {userIds: [...]})
-      confirm_compromised      — Confirm users as compromised (body: {userIds: [...]})
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -2294,7 +2200,7 @@ async def manage_identity_protection(
 # ===========================================================================
 # TOOL 25 — App Registrations & Enterprise Apps
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_app_registrations(
     action: str,
     app_id: str = "",
@@ -2306,20 +2212,17 @@ async def manage_app_registrations(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Manage Entra ID app registrations and enterprise apps (service principals).
+    Read-only: view Entra ID app registrations and enterprise apps (service principals).
 
     action values:
       list_registrations   — List all app registrations
       get_registration     — Get app registration details (app_id)
       search_registrations — Search registrations by name (search_term)
-      delete_registration  — Delete an app registration (app_id, confirm=True)
       get_expiring_credentials — App regs with credentials expiring soon (days_until_expiry)
       list_enterprise_apps — List all enterprise apps (service principals)
       get_enterprise_app   — Get enterprise app details (sp_id)
       search_enterprise_apps — Search enterprise apps by name (search_term)
       get_app_permissions  — Permissions granted to an enterprise app (sp_id)
-      enable_enterprise_app  — Enable an enterprise app (sp_id)
-      disable_enterprise_app — Disable an enterprise app (sp_id)
     """
     c = get_graph_client()
     a = action.lower().strip()
@@ -2391,7 +2294,7 @@ async def manage_app_registrations(
 # ===========================================================================
 # TOOL 26 — Tenant Administration
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_tenant_admin(
     action: str,
     role_id: str = "",
@@ -2402,7 +2305,7 @@ async def manage_tenant_admin(
     confirm: bool = False,
 ) -> dict[str, Any]:
     """
-    Tenant administration — org info, service health, directory roles, subscriptions, terms of use.
+    Read-only tenant information — org info, service health, directory roles, subscriptions, terms of use.
 
     action values:
       get_org_info          — Get organization/tenant information
@@ -2414,12 +2317,9 @@ async def manage_tenant_admin(
       list_directory_roles  — List active directory roles
       get_role_members      — List members of a directory role (role_id)
       get_global_admins     — List Global Administrator members
-      assign_directory_role — Assign directory role to user/group (role_id, body)
-      remove_directory_role_member — Remove member from role (role_id, member_id, confirm=True)
       get_subscriptions     — List subscribed license SKUs
       get_security_defaults — Check security defaults status
       list_terms_of_use     — List Terms of Use agreements
-      create_terms_of_use   — Create a Terms of Use agreement (body)
       get_cross_tenant_policy — Get cross-tenant access (B2B) policy
     """
     c = get_graph_client()
@@ -2506,7 +2406,7 @@ async def manage_tenant_admin(
 # ===========================================================================
 # TOOL 27 — Intune Reports & Analytics (read-only)
 # ===========================================================================
-@mcp.tool()
+@_tool()
 async def manage_intune_reports(
     action: str,
     report_name: str = "",
@@ -2664,10 +2564,12 @@ def _read_only_catalog() -> dict[str, dict[str, Any]]:
     }
 
 
-@mcp.tool()
+@_tool()
 async def discover_graph_operations(category: str = "") -> dict[str, Any]:
     """List all supported read-only Graph operations grouped by tool/domain."""
     catalog = _read_only_catalog()
+    if _ENABLED_TOOLS:
+        catalog = {k: v for k, v in catalog.items() if k in _ENABLED_TOOLS}
     if category:
         cat_lower = category.lower()
         catalog = {
