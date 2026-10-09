@@ -1,0 +1,59 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/teams/v1.29/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.29",
+  "version": "1.0.0",
+  "id": "${{APP_ID}}",
+  "developer": {
+    "name": "${{DEVELOPER_NAME}}",
+    "websiteUrl": "${{DEVELOPER_WEBSITE_URL}}",
+    "privacyUrl": "${{DEVELOPER_PRIVACY_URL}}",
+    "termsOfUseUrl": "${{DEVELOPER_TERMS_URL}}"
+  },
+  "name": {
+    "short": "Endpoint Intelligence",
+    "full": "Endpoint Intelligence for Copilot Cowork"
+  },
+  "description": {
+    "short": "Read-only Intune and Entra insights and endpoint reports.",
+    "full": "Endpoint Intelligence gives Copilot Cowork read-only access to Microsoft Intune and Microsoft Entra data through the EndpointRead-MCP server. Ask about managed devices, compliance, app deployment, configuration and security policies, Autopilot, Windows servicing, Entra users, groups and devices, identity security, and tenant health. It produces engineering detail or management summaries suitable for Word, Excel, PowerPoint, email and SharePoint. It never changes, wipes, resets or deletes anything."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#0F6CBD",
+  "agentSkills": [
+    { "folder": "./skills/endpoint-device-overview" },
+    { "folder": "./skills/endpoint-compliance-report" },
+    { "folder": "./skills/endpoint-app-deployment" },
+    { "folder": "./skills/endpoint-policy-status" },
+    { "folder": "./skills/endpoint-security-posture" },
+    { "folder": "./skills/endpoint-autopilot-enrollment" },
+    { "folder": "./skills/endpoint-windows-servicing" },
+    { "folder": "./skills/endpoint-scripts-remediations" },
+    { "folder": "./skills/endpoint-intune-rbac" },
+    { "folder": "./skills/endpoint-analytics-reports" },
+    { "folder": "./skills/entra-directory-lookup" },
+    { "folder": "./skills/entra-identity-security" },
+    { "folder": "./skills/entra-app-registrations" },
+    { "folder": "./skills/tenant-admin-health" },
+    { "folder": "./skills/endpoint-connection-check" },
+    { "folder": "./skills/endpoint-periodic-summary" }
+  ],
+  "agentConnectors": [
+    {
+      "id": "endpointread-mcp",
+      "displayName": "EndpointRead-MCP (Intune and Entra, read-only)",
+      "description": "Read-only Microsoft Intune and Microsoft Entra data from Microsoft Graph: managed devices, compliance, apps, policies, Autopilot, Windows Update, reports, users, groups, devices, identity security and tenant health.",
+      "toolSource": {
+        "remoteMcpServer": {
+          "mcpServerUrl": "${{MCP_SERVER_URL}}",
+          "authorization": {
+            "type": "OAuthPluginVault",
+            "referenceId": "${{OAUTH_REFERENCE_ID}}"
+          }
+        }
+      }
+    }
+  ]
+}
