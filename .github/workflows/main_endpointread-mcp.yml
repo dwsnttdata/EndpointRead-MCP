@@ -7,7 +7,7 @@ name: Build and deploy Python app to Azure Web App - EndpointRead-MCP
 on:
   push:
     branches:
-      - main
+      - 'main'
   workflow_dispatch:
 
 jobs:
@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'EndpointRead-MCP'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_56C46CB0208E41878264D25AC8992F76 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_67DB5E1628794147826BCE1171608CEC }}
