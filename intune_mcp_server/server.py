@@ -28,7 +28,6 @@ from mcp.types import ToolAnnotations
 from intune_mcp_server.config import get_config  # noqa: F401  (ensures .env is loaded)
 from intune_mcp_server.graph_client import AuthRequiredError, get_graph_client
 
-
 def _transport_security() -> TransportSecuritySettings:
     """Allow local dev hosts plus the Azure App Service hostname (Copilot Studio hosting)."""
     allowed_hosts = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
@@ -54,7 +53,6 @@ def _transport_security() -> TransportSecuritySettings:
         allowed_origins=allowed_origins,
     )
 
-
 # Copilot Studio requires JSON responses (not SSE streaming) and a stateless
 # HTTP transport since each call may be routed to a different instance.
 mcp = FastMCP(
@@ -69,7 +67,6 @@ mcp = FastMCP(
 _ENABLED_TOOLS = {t.strip() for t in os.getenv("MCP_ENABLED_TOOLS", "").split(",") if t.strip()}
 # Optional cap (seconds) on report export polling; 0 keeps each call's own timeout.
 _EXPORT_TIMEOUT_CAP = int(os.getenv("REPORT_EXPORT_TIMEOUT_SECONDS", "0") or 0)
-
 
 def _tool():
     """Register a tool as read-only, unless MCP_ENABLED_TOOLS excludes it."""
@@ -87,25 +84,13 @@ def _tool():
         return mcp.tool(title=title, annotations=annotations)(fn)
     return decorator
 
-
 def main() -> None:
     """Console entry point for stdio MCP transport."""
     mcp.run(transport="stdio")
 
-
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
-
-def _require_confirm(action: str, confirm: bool) -> dict[str, Any] | None:
-    """Return an error dict if a destructive action is called without confirm=True."""
-    if not confirm:
-        return {
-            "status": "confirmation_required",
-            "message": f"Action '{action}' is destructive. Resend with confirm=True to proceed.",
-        }
-    return None
-
 
 # Curated subset of the ~178 Intune report names available via the Graph
 # `/deviceManagement/reports/exportJobs` endpoint. Any valid Graph reportName
@@ -157,7 +142,6 @@ _COMMON_INTUNE_REPORTS: dict[str, str] = {
     "AllGroupsInMyOrg": "All groups in the organization",
 }
 
-
 async def _run_export_job(
     c,
     report_name: str,
@@ -185,7 +169,7 @@ async def _run_export_job(
     if _EXPORT_TIMEOUT_CAP > 0:
         timeout_seconds = min(timeout_seconds, _EXPORT_TIMEOUT_CAP)
 
-    job = await c.post("/deviceManagement/reports/exportJobs", use_beta=True, json=body)
+    job = await c.create_report_export_job(json=body)
     job_id = job.get("id")
     if not job_id:
         return {"error": f"Export job for '{report_name}' did not return a job id.", "response": job}
@@ -244,13 +228,12 @@ async def _run_export_job(
         "rows": rows[:max_rows],
     }
 
-
 # ===========================================================================
 # TOOL 1 — Connection & Health
 # ===========================================================================
 @_tool()
 async def authenticate_mcp_session() -> dict[str, Any]:
-    """Authenticate the MCP session using the configured .env sign-in flow."""
+    """Verify the current Copilot user can obtain a delegated Graph token."""
     c = get_graph_client()
     try:
         auth_info = await c.ensure_authenticated()
@@ -268,13 +251,24 @@ async def authenticate_mcp_session() -> dict[str, Any]:
     except Exception as exc:
         return {"status": "error", "message": str(exc)}
 
-
 @_tool()
 async def test_connection() -> dict[str, Any]:
     """Test the connection to Microsoft Graph API and return tenant information."""
     try:
         c = get_graph_client()
         await c.ensure_authenticated()
+        if c.config.auth_mode == "obo":
+            user = await c.get("/me")
+            return {
+                "status": "connected",
+                "message": "Microsoft Graph is connected as the signed-in user.",
+                "user": {
+                    "displayName": user.get("displayName"),
+                    "id": user.get("id"),
+                    "userPrincipalName": user.get("userPrincipalName"),
+                },
+            }
+
         org = await c.get("/organization")
         info = org.get("value", [{}])[0]
         return {
@@ -291,7 +285,6 @@ async def test_connection() -> dict[str, Any]:
             }
         return {"status": "error", "message": str(exc)}
 
-
 @_tool()
 async def get_auth_status() -> dict[str, Any]:
     """Get current authentication mode and sign-in/cache status."""
@@ -304,26 +297,32 @@ async def get_auth_status() -> dict[str, Any]:
             pass
     return await c.get_auth_status()
 
-
 @_tool()
 async def start_interactive_sign_in() -> dict[str, Any]:
     """Start user sign-in flow (device code) and return sign-in instructions."""
     c = get_graph_client()
+    if c.config.auth_mode == "obo":
+        return {
+            "status": "not_available",
+            "message": "Copilot Studio performs user sign-in for OBO. Authenticate the Copilot connection, then retry.",
+        }
     return await c.start_interactive_sign_in()
-
 
 @_tool()
 async def complete_interactive_sign_in() -> dict[str, Any]:
     """Complete user sign-in flow after user enters device code."""
     c = get_graph_client()
+    if c.config.auth_mode == "obo":
+        return {
+            "status": "not_available",
+            "message": "Copilot Studio performs user sign-in for OBO. Authenticate the Copilot connection, then retry.",
+        }
     return await c.complete_interactive_sign_in()
-
 
 @_tool()
 async def complete_interactive_login() -> dict[str, Any]:
     """Compatibility wrapper that completes the interactive sign-in flow for the MCP session."""
     return await complete_interactive_sign_in()
-
 
 @_tool()
 async def connect_intune_mcp_server() -> dict[str, Any]:
@@ -351,6 +350,18 @@ async def connect_intune_mcp_server() -> dict[str, Any]:
     # automatically trigger the configured sign-in flow from the .env settings.
     try:
         await c.ensure_authenticated()
+        if c.config.auth_mode == "obo":
+            user = await c.get("/me")
+            return {
+                "status": "connected",
+                "message": "Intune MCP server is connected as the signed-in user.",
+                "user": {
+                    "displayName": user.get("displayName"),
+                    "id": user.get("id"),
+                    "userPrincipalName": user.get("userPrincipalName"),
+                },
+            }
+
         org = await c.get("/organization")
         info = org.get("value", [{}])[0]
         return {
@@ -373,7 +384,6 @@ async def connect_intune_mcp_server() -> dict[str, Any]:
             "message": str(exc),
         }
 
-
 # ===========================================================================
 # TOOL 2 — Intune Overview
 # ===========================================================================
@@ -393,7 +403,6 @@ async def get_intune_overview() -> dict[str, Any]:
     except Exception as exc:
         return {"error": str(exc)}
 
-
 # ===========================================================================
 # TOOL 3 — Intune Managed Devices
 # ===========================================================================
@@ -406,8 +415,6 @@ async def manage_intune_devices(
     search_by: str = "deviceName",
     top: int = 50,
     days_inactive: int = 30,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune managed devices, inventory and compliance state.
@@ -483,82 +490,7 @@ async def manage_intune_devices(
         r = await c.get(f"/deviceManagement/managedDevices/{device_id}/logCollectionRequests", use_beta=True)
         return {"count": len(r.get("value", [])), "requests": r.get("value", [])}
 
-    if a == "sync":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/syncDevice")
-        return {"status": "success", "message": f"Sync triggered for {device_id}"}
-
-    if a == "bulk_sync":
-        ids = (body or {}).get("device_ids", [])
-        results = []
-        for did in ids:
-            try:
-                await c.post(f"/deviceManagement/managedDevices/{did}/syncDevice")
-                results.append({"device_id": did, "status": "synced"})
-            except Exception as exc:
-                results.append({"device_id": did, "status": "error", "error": str(exc)})
-        return {"results": results}
-
-    if a == "restart":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/rebootNow")
-        return {"status": "success", "message": f"Restart triggered for {device_id}"}
-
-    if a == "lock":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/remoteLock")
-        return {"status": "success", "message": f"Remote lock triggered for {device_id}"}
-
-    if a == "rename":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/setDeviceName", json=body or {}, use_beta=True)
-        return {"status": "success"}
-
-    if a == "locate":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/locateDevice")
-        return {"status": "success", "message": f"Locate triggered for {device_id}"}
-
-    if a == "reset_passcode":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/resetPasscode")
-        return {"status": "success"}
-
-    if a == "bypass_activation_lock":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/bypassActivationLock")
-        return {"status": "success"}
-
-    if a == "enable_lost_mode":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/enableLostMode", json=body or {}, use_beta=True)
-        return {"status": "success"}
-
-    if a == "disable_lost_mode":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/disableLostMode", use_beta=True)
-        return {"status": "success"}
-
-    if a == "collect_diagnostics":
-        default_body = {"templateType": {"@odata.type": "microsoft.graph.deviceLogCollectionRequest", "templateType": "predefined"}}
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/createDeviceLogCollectionRequest", json=body or default_body, use_beta=True)
-        return {"status": "success"}
-
-    if a == "defender_scan":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/windowsDefenderScan", json=body or {"quickScan": False})
-        return {"status": "success"}
-
-    if a == "defender_update_signatures":
-        await c.post(f"/deviceManagement/managedDevices/{device_id}/windowsDefenderUpdateSignatures")
-        return {"status": "success"}
-
-    if a in {"clean_device", "wipe", "retire", "delete"}:
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        if a == "clean_device":
-            await c.post(f"/deviceManagement/managedDevices/{device_id}/cleanWindowsDevice", json=body or {})
-        elif a == "wipe":
-            await c.post(f"/deviceManagement/managedDevices/{device_id}/wipe", json=body or {"keepEnrollmentData": False, "keepUserData": False})
-        elif a == "retire":
-            await c.post(f"/deviceManagement/managedDevices/{device_id}/retire")
-        elif a == "delete":
-            await c.delete(f"/deviceManagement/managedDevices/{device_id}")
-        return {"status": "success", "action": a, "device_id": device_id}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 4 — Device Encryption & BitLocker
@@ -599,12 +531,12 @@ async def manage_device_encryption(
         return await c.get(f"/deviceManagement/managedDevices/{device_id}/getFileVaultKey", use_beta=True)
 
     if a == "get_encryption_report":
-        r = await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                         json={"reportName": "DeviceEncryption", "filter": "", "select": []})
+        r = await c.create_report_export_job(
+            json={"reportName": "DeviceEncryption", "filter": "", "select": []}
+        )
         return r
 
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 5 — Intune App Management
@@ -615,9 +547,7 @@ async def manage_intune_apps(
     app_id: str = "",
     search_term: str = "",
     top: int = 50,
-    body: dict | None = None,
     assignment_id: str = "",
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune mobile apps, assignments and install status.
@@ -660,32 +590,6 @@ async def manage_intune_apps(
         )
         return {"count": len(r.get("value", [])), "apps": r.get("value", [])}
 
-    if a == "create":
-        return await c.post("/deviceAppManagement/mobileApps", json=body or {})
-
-    if a == "update":
-        return await c.patch(f"/deviceAppManagement/mobileApps/{app_id}", json=body or {})
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceAppManagement/mobileApps/{app_id}")
-        return {"status": "success"}
-
-    if a == "assign":
-        b = body or {}
-        if "mobileAppAssignments" not in b and "assignments" in b:
-            b = {"mobileAppAssignments": b["assignments"]}
-        return await c.post(f"/deviceAppManagement/mobileApps/{app_id}/assign", json=b)
-
-    if a == "remove_assignment":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceAppManagement/mobileApps/{app_id}/assignments/{assignment_id}")
-        return {"status": "success"}
-
     if a == "get_install_status":
         return await c.get(f"/deviceAppManagement/mobileApps/{app_id}/installSummary")
 
@@ -699,7 +603,6 @@ async def manage_intune_apps(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 6 — App Config & MAM Policies
 # ===========================================================================
@@ -708,8 +611,6 @@ async def manage_app_config_mam(
     action: str,
     policy_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
     platform: str = "ios",
 ) -> dict[str, Any]:
     """
@@ -738,38 +639,11 @@ async def manage_app_config_mam(
     if a == "get_config_policy":
         return await c.get(f"/deviceAppManagement/targetedManagedAppConfigurations/{policy_id}")
 
-    if a == "create_config_policy":
-        return await c.post("/deviceAppManagement/targetedManagedAppConfigurations", json=body or {})
-
-    if a == "update_config_policy":
-        return await c.patch(f"/deviceAppManagement/targetedManagedAppConfigurations/{policy_id}", json=body or {})
-
-    if a == "delete_config_policy":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceAppManagement/targetedManagedAppConfigurations/{policy_id}")
-        return {"status": "success"}
-
     if a == "list_protection_policies":
         r = await c.get(f"/deviceAppManagement/managedAppPolicies?$top={top}")
         return {"count": len(r.get("value", [])), "policies": r.get("value", [])}
 
-    if a == "create_protection_policy":
-        return await c.post(plat_ep, json=body or {})
-
-    if a == "update_protection_policy":
-        return await c.patch(f"{plat_ep}/{policy_id}", json=body or {})
-
-    if a == "delete_protection_policy":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{plat_ep}/{policy_id}")
-        return {"status": "success"}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 7 — Compliance Policies
@@ -779,8 +653,6 @@ async def manage_compliance_policies(
     action: str,
     policy_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune device compliance policies, assignments and status.
@@ -809,22 +681,6 @@ async def manage_compliance_policies(
     if a == "get":
         return await c.get(f"{base}/{policy_id}")
 
-    if a == "create":
-        return await c.post(base, json=body or {})
-
-    if a == "update":
-        return await c.patch(f"{base}/{policy_id}", json=body or {})
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{base}/{policy_id}")
-        return {"status": "success"}
-
-    if a == "assign":
-        return await c.post(f"{base}/{policy_id}/assign", json=body or {})
-
     if a == "get_status":
         r = await c.get(f"{base}/{policy_id}/deviceStatuses")
         return {"count": len(r.get("value", [])), "statuses": r.get("value", [])}
@@ -835,7 +691,6 @@ async def manage_compliance_policies(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 8 — Configuration Profiles
 # ===========================================================================
@@ -844,8 +699,6 @@ async def manage_configuration_profiles(
     action: str,
     profile_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune device configuration profiles, assignments and status.
@@ -874,22 +727,6 @@ async def manage_configuration_profiles(
     if a == "get":
         return await c.get(f"{base}/{profile_id}")
 
-    if a == "create":
-        return await c.post(base, json=body or {})
-
-    if a == "update":
-        return await c.patch(f"{base}/{profile_id}", json=body or {})
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{base}/{profile_id}")
-        return {"status": "success"}
-
-    if a == "assign":
-        return await c.post(f"{base}/{profile_id}/assign", json=body or {})
-
     if a == "get_status":
         r = await c.get(f"{base}/{profile_id}/deviceStatuses")
         return {"count": len(r.get("value", [])), "statuses": r.get("value", [])}
@@ -900,7 +737,6 @@ async def manage_configuration_profiles(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 9 — Settings Catalog
 # ===========================================================================
@@ -909,8 +745,6 @@ async def manage_settings_catalog(
     action: str,
     policy_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune settings catalog configuration policies.
@@ -937,24 +771,7 @@ async def manage_settings_catalog(
     if a == "get":
         return await c.get(f"{base}/{policy_id}", use_beta=True)
 
-    if a == "create":
-        return await c.post(base, json=body or {}, use_beta=True)
-
-    if a == "update":
-        return await c.patch(f"{base}/{policy_id}", json=body or {}, use_beta=True)
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{base}/{policy_id}", use_beta=True)
-        return {"status": "success"}
-
-    if a == "assign":
-        return await c.post(f"{base}/{policy_id}/assign", json=body or {}, use_beta=True)
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 10 — ADMX / Group Policy Configurations
@@ -964,8 +781,6 @@ async def manage_admx_policies(
     action: str,
     config_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune ADMX (Administrative Templates / Group Policy) configurations.
@@ -992,18 +807,7 @@ async def manage_admx_policies(
     if a == "get":
         return await c.get(f"{base}/{config_id}", use_beta=True)
 
-    if a == "create":
-        return await c.post(base, json=body or {}, use_beta=True)
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{base}/{config_id}", use_beta=True)
-        return {"status": "success"}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 11 — Endpoint Security
@@ -1014,8 +818,6 @@ async def manage_endpoint_security(
     policy_id: str = "",
     template_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune endpoint security policies (Antivirus, Firewall, EDR, etc.).
@@ -1043,22 +845,6 @@ async def manage_endpoint_security(
     if a == "get_policy":
         return await c.get(f"/deviceManagement/intents/{policy_id}", use_beta=True)
 
-    if a == "create_policy":
-        return await c.post(f"/deviceManagement/templates/{template_id}/createInstance", use_beta=True, json=body or {})
-
-    if a == "update_policy":
-        return await c.patch(f"/deviceManagement/intents/{policy_id}", use_beta=True, json=body or {})
-
-    if a == "delete_policy":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/intents/{policy_id}", use_beta=True)
-        return {"status": "success"}
-
-    if a == "assign_policy":
-        return await c.post(f"/deviceManagement/intents/{policy_id}/assign", use_beta=True, json=body or {})
-
     if a == "get_policy_status":
         return await c.get(f"/deviceManagement/intents/{policy_id}/deviceStateSummary", use_beta=True)
 
@@ -1067,7 +853,6 @@ async def manage_endpoint_security(
         return {"count": len(r.get("value", [])), "templates": r.get("value", [])}
 
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 12 — Security Baselines
@@ -1110,7 +895,6 @@ async def manage_security_baselines(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 13 — Windows Update Policies
 # ===========================================================================
@@ -1119,8 +903,6 @@ async def manage_windows_update(
     action: str,
     policy_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Windows Update rings and feature/quality/driver update profiles.
@@ -1150,28 +932,12 @@ async def manage_windows_update(
     if a == "get_update_ring":
         return await c.get(f"/deviceManagement/deviceConfigurations/{policy_id}")
 
-    if a == "create_update_ring":
-        return await c.post("/deviceManagement/deviceConfigurations", json=body or {})
-
-    if a == "update_update_ring":
-        return await c.patch(f"/deviceManagement/deviceConfigurations/{policy_id}", json=body or {})
-
-    if a == "delete_update_ring":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/deviceConfigurations/{policy_id}")
-        return {"status": "success"}
-
     if a == "list_feature_updates":
         r = await c.get(f"/deviceManagement/windowsFeatureUpdateProfiles?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "profiles": r.get("value", [])}
 
     if a == "get_feature_update":
         return await c.get(f"/deviceManagement/windowsFeatureUpdateProfiles/{policy_id}", use_beta=True)
-
-    if a == "create_feature_update":
-        return await c.post("/deviceManagement/windowsFeatureUpdateProfiles", use_beta=True, json=body or {})
 
     if a == "list_quality_updates":
         r = await c.get(f"/deviceManagement/windowsQualityUpdateProfiles?$top={top}", use_beta=True)
@@ -1183,7 +949,6 @@ async def manage_windows_update(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 14 — Intune Scripts & Remediations
 # ===========================================================================
@@ -1192,8 +957,6 @@ async def manage_intune_scripts(
     action: str,
     script_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
     script_type: str = "powershell",
 ) -> dict[str, Any]:
     """
@@ -1230,28 +993,11 @@ async def manage_intune_scripts(
     if a == "get":
         return await c.get(f"{base}/{script_id}", use_beta=True)
 
-    if a == "create":
-        return await c.post(base, use_beta=True, json=body or {})
-
-    if a == "update":
-        return await c.patch(f"{base}/{script_id}", use_beta=True, json=body or {})
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{base}/{script_id}", use_beta=True)
-        return {"status": "success"}
-
-    if a == "assign":
-        return await c.post(f"{base}/{script_id}/assignments", use_beta=True, json=body or {})
-
     if a == "get_status":
         r = await c.get(f"{base}/{script_id}/deviceRunStates", use_beta=True)
         return {"count": len(r.get("value", [])), "states": r.get("value", [])}
 
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 15 — Enrollment
@@ -1262,8 +1008,6 @@ async def manage_intune_enrollment(
     config_id: str = "",
     token_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune enrollment restrictions, Apple VPP/DEP tokens, and Android Enterprise.
@@ -1291,22 +1035,6 @@ async def manage_intune_enrollment(
         r = await c.get(f"/deviceManagement/deviceEnrollmentConfigurations?$top={top}")
         return {"count": len(r.get("value", [])), "configurations": r.get("value", [])}
 
-    if a == "create_restriction":
-        return await c.post("/deviceManagement/deviceEnrollmentConfigurations", json=body or {})
-
-    if a == "update_restriction":
-        return await c.patch(f"/deviceManagement/deviceEnrollmentConfigurations/{config_id}", json=body or {})
-
-    if a == "delete_restriction":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/deviceEnrollmentConfigurations/{config_id}")
-        return {"status": "success"}
-
-    if a == "assign_restriction":
-        return await c.post(f"/deviceManagement/deviceEnrollmentConfigurations/{config_id}/assign", json=body or {})
-
     if a == "list_vpp_tokens":
         r = await c.get(f"/deviceAppManagement/vppTokens?$top={top}")
         return {"count": len(r.get("value", [])), "tokens": r.get("value", [])}
@@ -1314,30 +1042,24 @@ async def manage_intune_enrollment(
     if a == "get_vpp_token":
         return await c.get(f"/deviceAppManagement/vppTokens/{token_id}")
 
-    if a == "sync_vpp_token":
-        return await c.post(f"/deviceAppManagement/vppTokens/{token_id}/syncLicenses")
-
     if a == "list_dep_tokens":
         r = await c.get(f"/deviceManagement/depOnboardingSettings?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "tokens": r.get("value", [])}
-
-    if a == "sync_dep_token":
-        return await c.post(f"/deviceManagement/depOnboardingSettings/{token_id}/syncWithAppleDeviceEnrollmentProgram", use_beta=True)
 
     if a == "list_android_enterprise":
         r = await c.get("/deviceManagement/androidManagedStoreAccountEnterpriseSettings", use_beta=True)
         return r
 
     if a == "get_failures_report":
-        return await c.post("/deviceManagement/reports/exportJobs", use_beta=True,
-                            json={"reportName": "DeviceEnrollmentFailures", "filter": "", "select": []})
+        return await c.create_report_export_job(
+            json={"reportName": "DeviceEnrollmentFailures", "filter": "", "select": []}
+        )
 
     if a == "list_dep_profiles":
         r = await c.get(f"/deviceManagement/depOnboardingSettings/{token_id}/enrollmentProfiles", use_beta=True)
         return {"count": len(r.get("value", [])), "profiles": r.get("value", [])}
 
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 16 — Autopilot
@@ -1348,8 +1070,6 @@ async def manage_autopilot(
     device_id: str = "",
     profile_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Windows Autopilot devices, deployment profiles and deployment status.
@@ -1382,32 +1102,6 @@ async def manage_autopilot(
     if a == "get_profile":
         return await c.get(f"/deviceManagement/windowsAutopilotDeploymentProfiles/{profile_id}", use_beta=True)
 
-    if a == "create_profile":
-        return await c.post("/deviceManagement/windowsAutopilotDeploymentProfiles", use_beta=True, json=body or {})
-
-    if a == "update_profile":
-        return await c.patch(f"/deviceManagement/windowsAutopilotDeploymentProfiles/{profile_id}", use_beta=True, json=body or {})
-
-    if a == "delete_profile":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/windowsAutopilotDeploymentProfiles/{profile_id}", use_beta=True)
-        return {"status": "success"}
-
-    if a == "assign_profile":
-        return await c.post(f"/deviceManagement/windowsAutopilotDeploymentProfiles/{profile_id}/assignments", use_beta=True, json=body or {})
-
-    if a == "import_device":
-        return await c.post("/deviceManagement/importedWindowsAutopilotDeviceIdentities", use_beta=True, json=body or {})
-
-    if a == "delete_device":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/windowsAutopilotDeviceIdentities/{device_id}", use_beta=True)
-        return {"status": "success"}
-
     if a == "get_deployment_status":
         r = await c.get(f"/deviceManagement/autopilotEvents?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "events": r.get("value", [])}
@@ -1422,7 +1116,6 @@ async def manage_autopilot(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 17 — Filters & Scope Tags
 # ===========================================================================
@@ -1432,8 +1125,6 @@ async def manage_filters_tags(
     filter_id: str = "",
     tag_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune assignment filters and scope tags.
@@ -1460,35 +1151,11 @@ async def manage_filters_tags(
     if a == "get_filter":
         return await c.get(f"/deviceManagement/assignmentFilters/{filter_id}", use_beta=True)
 
-    if a == "create_filter":
-        return await c.post("/deviceManagement/assignmentFilters", json=body or {}, use_beta=True)
-
-    if a == "update_filter":
-        return await c.patch(f"/deviceManagement/assignmentFilters/{filter_id}", json=body or {}, use_beta=True)
-
-    if a == "delete_filter":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/assignmentFilters/{filter_id}", use_beta=True)
-        return {"status": "success"}
-
     if a == "list_tags":
         r = await c.get(f"/deviceManagement/roleScopeTags?$top={top}", use_beta=True)
         return {"count": len(r.get("value", [])), "tags": r.get("value", [])}
 
-    if a == "create_tag":
-        return await c.post("/deviceManagement/roleScopeTags", json=body or {}, use_beta=True)
-
-    if a == "delete_tag":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/roleScopeTags/{tag_id}", use_beta=True)
-        return {"status": "success"}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 18 — Intune RBAC
@@ -1499,8 +1166,6 @@ async def manage_intune_rbac(
     role_id: str = "",
     assignment_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Intune RBAC role definitions and role assignments.
@@ -1531,35 +1196,11 @@ async def manage_intune_rbac(
     if a == "get_role":
         return await c.get(f"/deviceManagement/roleDefinitions/{role_id}")
 
-    if a == "create_role":
-        return await c.post("/deviceManagement/roleDefinitions", json=body or {})
-
-    if a == "update_role":
-        return await c.patch(f"/deviceManagement/roleDefinitions/{role_id}", json=body or {})
-
-    if a == "delete_role":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/roleDefinitions/{role_id}")
-        return {"status": "success"}
-
     if a == "list_assignments":
         r = await c.get(f"/deviceManagement/roleAssignments?$top={top}")
         return {"count": len(r.get("value", [])), "assignments": r.get("value", [])}
 
-    if a == "create_assignment":
-        return await c.post("/deviceManagement/roleAssignments", json=body or {})
-
-    if a == "delete_assignment":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/roleAssignments/{assignment_id}")
-        return {"status": "success"}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 19 — Windows 365 Cloud PC
@@ -1571,8 +1212,6 @@ async def manage_cloud_pc(
     policy_id: str = "",
     connection_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Windows 365 Cloud PCs, provisioning policies and network connections.
@@ -1614,28 +1253,6 @@ async def manage_cloud_pc(
             status_map[s] = status_map.get(s, 0) + 1
         return {"total": len(items), "by_status": status_map}
 
-    if a == "restart":
-        await c.post(f"{ve}/cloudPCs/{cloud_pc_id}/reboot")
-        return {"status": "success"}
-
-    if a == "reprovision":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.post(f"{ve}/cloudPCs/{cloud_pc_id}/reprovision", json=body or {})
-        return {"status": "success"}
-
-    if a == "resize":
-        return await c.post(f"{ve}/cloudPCs/{cloud_pc_id}/resize", use_beta=True, json=body or {})
-
-    if a == "restore":
-        await c.post(f"{ve}/cloudPCs/{cloud_pc_id}/restore", json=body or {})
-        return {"status": "success"}
-
-    if a == "troubleshoot":
-        await c.post(f"{ve}/cloudPCs/{cloud_pc_id}/troubleshoot")
-        return {"status": "success"}
-
     if a == "list_snapshots":
         r = await c.get(f"{ve}/cloudPCs/{cloud_pc_id}/snapshots", use_beta=True)
         return {"count": len(r.get("value", [])), "snapshots": r.get("value", [])}
@@ -1648,12 +1265,6 @@ async def manage_cloud_pc(
         r = await c.get(f"{ve}/provisioningPolicies?$top={top}")
         return {"count": len(r.get("value", [])), "policies": r.get("value", [])}
 
-    if a == "create_provisioning_policy":
-        return await c.post(f"{ve}/provisioningPolicies", json=body or {})
-
-    if a == "assign_provisioning_policy":
-        return await c.post(f"{ve}/provisioningPolicies/{policy_id}/assign", json=body or {})
-
     if a == "list_gallery_images":
         r = await c.get(f"{ve}/galleryImages?$top={top}")
         return {"count": len(r.get("value", [])), "images": r.get("value", [])}
@@ -1664,7 +1275,6 @@ async def manage_cloud_pc(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 20 — Entra ID Users
 # ===========================================================================
@@ -1674,8 +1284,6 @@ async def manage_entra_users(
     user_id: str = "",
     search_term: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Entra ID users, their devices, licenses, reports and group memberships.
@@ -1712,35 +1320,6 @@ async def manage_entra_users(
         r = await c.get(f"/users?$filter=startswith(displayName,'{search_term}')&$top={top}")
         return {"count": len(r.get("value", [])), "users": r.get("value", [])}
 
-    if a == "create":
-        return await c.post("/users", json=body or {})
-
-    if a == "update":
-        await c.patch(f"/users/{user_id}", json=body or {})
-        return {"status": "success"}
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/users/{user_id}")
-        return {"status": "success"}
-
-    if a == "enable":
-        await c.patch(f"/users/{user_id}", json={"accountEnabled": True})
-        return {"status": "success", "message": f"User {user_id} enabled"}
-
-    if a == "disable":
-        await c.patch(f"/users/{user_id}", json={"accountEnabled": False})
-        return {"status": "success", "message": f"User {user_id} disabled"}
-
-    if a == "reset_password":
-        await c.patch(f"/users/{user_id}", json={"passwordProfile": body or {}})
-        return {"status": "success"}
-
-    if a == "revoke_sessions":
-        return await c.post(f"/users/{user_id}/revokeSignInSessions")
-
     if a == "get_devices":
         r = await c.get(f"/users/{user_id}/managedDevices")
         return {"count": len(r.get("value", [])), "devices": r.get("value", [])}
@@ -1748,9 +1327,6 @@ async def manage_entra_users(
     if a == "get_licenses":
         r = await c.get(f"/users/{user_id}/licenseDetails")
         return {"count": len(r.get("value", [])), "licenses": r.get("value", [])}
-
-    if a in {"assign_license", "remove_license"}:
-        return await c.post(f"/users/{user_id}/assignLicense", json=body or {})
 
     if a == "list_available_licenses":
         r = await c.get("/subscribedSkus")
@@ -1760,17 +1336,6 @@ async def manage_entra_users(
         r = await c.get(f"/directory/deletedItems/microsoft.graph.user?$top={top}")
         return {"count": len(r.get("value", [])), "users": r.get("value", [])}
 
-    if a == "restore_user":
-        return await c.post(f"/directory/deletedItems/{user_id}/restore")
-
-    if a == "assign_manager":
-        await c.put(f"/users/{user_id}/manager/$ref", json=body or {})
-        return {"status": "success"}
-
-    if a == "remove_manager":
-        await c.delete(f"/users/{user_id}/manager/$ref")
-        return {"status": "success"}
-
     if a == "get_direct_reports":
         r = await c.get(f"/users/{user_id}/directReports")
         return {"count": len(r.get("value", [])), "reports": r.get("value", [])}
@@ -1779,74 +1344,7 @@ async def manage_entra_users(
         r = await c.get(f"/users/{user_id}/memberOf")
         return {"count": len(r.get("value", [])), "groups": r.get("value", [])}
 
-    if a == "onboard_user":
-        data = body or {}
-        user = await c.post("/users", json=data.get("user", {}))
-        uid = user.get("id", "")
-        results: list[dict] = [{"step": "create_user", "id": uid, "status": "ok"}]
-        if data.get("manager"):
-            try:
-                await c.put(f"/users/{uid}/manager/$ref", json=data["manager"])
-                results.append({"step": "assign_manager", "status": "ok"})
-            except Exception as exc:
-                results.append({"step": "assign_manager", "status": "error", "error": str(exc)})
-        if data.get("license"):
-            try:
-                await c.post(f"/users/{uid}/assignLicense", json=data["license"])
-                results.append({"step": "assign_license", "status": "ok"})
-            except Exception as exc:
-                results.append({"step": "assign_license", "status": "error", "error": str(exc)})
-        for gid in data.get("group_ids", []):
-            try:
-                await c.post(f"/groups/{gid}/members/$ref", json={"@odata.id": f"https://graph.microsoft.com/v1.0/directoryObjects/{uid}"})
-                results.append({"step": f"add_to_group_{gid}", "status": "ok"})
-            except Exception as exc:
-                results.append({"step": f"add_to_group_{gid}", "status": "error", "error": str(exc)})
-        return {"user_id": uid, "steps": results}
-
-    if a == "offboard_user":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        results = []
-        try:
-            await c.patch(f"/users/{user_id}", json={"accountEnabled": False})
-            results.append({"step": "disable_account", "status": "ok"})
-        except Exception as exc:
-            results.append({"step": "disable_account", "status": "error", "error": str(exc)})
-        try:
-            await c.post(f"/users/{user_id}/revokeSignInSessions")
-            results.append({"step": "revoke_sessions", "status": "ok"})
-        except Exception as exc:
-            results.append({"step": "revoke_sessions", "status": "error", "error": str(exc)})
-        return {"user_id": user_id, "steps": results}
-
-    if a == "bulk_create":
-        users = (body or {}).get("users", [])
-        results = []
-        for u in users:
-            try:
-                created = await c.post("/users", json=u)
-                results.append({"upn": u.get("userPrincipalName"), "id": created.get("id"), "status": "ok"})
-            except Exception as exc:
-                results.append({"upn": u.get("userPrincipalName"), "status": "error", "error": str(exc)})
-        return {"created": len([r for r in results if r.get("status") == "ok"]), "results": results}
-
-    if a == "bulk_assign_license":
-        data = body or {}
-        sku = data.get("skuId", "")
-        user_ids = data.get("user_ids", [])
-        results = []
-        for uid in user_ids:
-            try:
-                await c.post(f"/users/{uid}/assignLicense", json={"addLicenses": [{"skuId": sku}], "removeLicenses": []})
-                results.append({"user_id": uid, "status": "ok"})
-            except Exception as exc:
-                results.append({"user_id": uid, "status": "error", "error": str(exc)})
-        return {"results": results}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 21 — Entra ID Groups
@@ -1858,8 +1356,6 @@ async def manage_entra_groups(
     member_id: str = "",
     search_term: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Entra ID groups, members and owners.
@@ -1892,70 +1388,15 @@ async def manage_entra_groups(
         r = await c.get(f"/groups?$filter=startswith(displayName,'{search_term}')&$top={top}")
         return {"count": len(r.get("value", [])), "groups": r.get("value", [])}
 
-    if a == "create_security":
-        d = body or {}
-        payload = {"displayName": d.get("displayName", ""), "description": d.get("description", ""),
-                   "securityEnabled": True, "mailEnabled": False, "mailNickname": d.get("mailNickname", d.get("displayName", "group").replace(" ", ""))}
-        return await c.post("/groups", json=payload)
-
-    if a == "create_m365":
-        d = body or {}
-        payload = {"displayName": d.get("displayName", ""), "description": d.get("description", ""),
-                   "groupTypes": ["Unified"], "securityEnabled": False, "mailEnabled": True,
-                   "mailNickname": d.get("mailNickname", d.get("displayName", "group").replace(" ", ""))}
-        payload.update({k: v for k, v in d.items() if k not in payload})
-        return await c.post("/groups", json=payload)
-
-    if a == "create_dynamic":
-        return await c.post("/groups", json=body or {})
-
-    if a == "update":
-        await c.patch(f"/groups/{group_id}", json=body or {})
-        return {"status": "success"}
-
-    if a == "delete":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/groups/{group_id}")
-        return {"status": "success"}
-
     if a == "get_members":
         r = await c.get(f"/groups/{group_id}/members?$top={top}")
         return {"count": len(r.get("value", [])), "members": r.get("value", [])}
-
-    if a == "add_member":
-        await c.post(f"/groups/{group_id}/members/$ref",
-                     json={"@odata.id": f"https://graph.microsoft.com/v1.0/directoryObjects/{member_id}"})
-        return {"status": "success"}
-
-    if a == "remove_member":
-        await c.delete(f"/groups/{group_id}/members/{member_id}/$ref")
-        return {"status": "success"}
 
     if a == "get_owners":
         r = await c.get(f"/groups/{group_id}/owners?$top={top}")
         return {"count": len(r.get("value", [])), "owners": r.get("value", [])}
 
-    if a == "add_owner":
-        await c.post(f"/groups/{group_id}/owners/$ref",
-                     json={"@odata.id": f"https://graph.microsoft.com/v1.0/directoryObjects/{member_id}"})
-        return {"status": "success"}
-
-    if a == "bulk_add_members":
-        member_ids = (body or {}).get("member_ids", [])
-        results = []
-        for mid in member_ids:
-            try:
-                await c.post(f"/groups/{group_id}/members/$ref",
-                             json={"@odata.id": f"https://graph.microsoft.com/v1.0/directoryObjects/{mid}"})
-                results.append({"member_id": mid, "status": "ok"})
-            except Exception as exc:
-                results.append({"member_id": mid, "status": "error", "error": str(exc)})
-        return {"results": results}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 22 — Entra ID Devices
@@ -1967,7 +1408,6 @@ async def manage_entra_devices(
     intune_device_id: str = "",
     search_term: str = "",
     top: int = 50,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Entra ID device objects (separate from Intune managed devices).
@@ -1998,43 +1438,7 @@ async def manage_entra_devices(
         r = await c.get(f"/devices?$filter=startswith(displayName,'{search_term}')&$top={top}")
         return {"count": len(r.get("value", [])), "devices": r.get("value", [])}
 
-    if a == "enable":
-        await c.patch(f"/devices/{device_id}", json={"accountEnabled": True})
-        return {"status": "success"}
-
-    if a == "disable":
-        await c.patch(f"/devices/{device_id}", json={"accountEnabled": False})
-        return {"status": "success"}
-
-    if a == "delete_entra":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/devices/{device_id}")
-        return {"status": "success"}
-
-    if a == "delete_intune":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/deviceManagement/managedDevices/{intune_device_id}")
-        return {"status": "success"}
-
-    if a == "delete_both":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        results = []
-        for label, ep in [("intune", f"/deviceManagement/managedDevices/{intune_device_id}"), ("entra", f"/devices/{device_id}")]:
-            try:
-                await c.delete(ep)
-                results.append({"source": label, "status": "deleted"})
-            except Exception as exc:
-                results.append({"source": label, "status": "error", "error": str(exc)})
-        return {"results": results}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 23 — Conditional Access
@@ -2045,8 +1449,6 @@ async def manage_conditional_access(
     policy_id: str = "",
     location_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Entra ID Conditional Access policies and named locations.
@@ -2075,48 +1477,11 @@ async def manage_conditional_access(
     if a == "get_policy":
         return await c.get(f"{ca}/{policy_id}")
 
-    if a == "create_policy":
-        return await c.post(ca, json=body or {})
-
-    if a == "update_policy":
-        await c.patch(f"{ca}/{policy_id}", json=body or {})
-        return {"status": "success"}
-
-    if a == "delete_policy":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{ca}/{policy_id}")
-        return {"status": "success"}
-
-    if a == "enable_policy":
-        await c.patch(f"{ca}/{policy_id}", json={"state": "enabled"})
-        return {"status": "success"}
-
-    if a == "disable_policy":
-        await c.patch(f"{ca}/{policy_id}", json={"state": "disabled"})
-        return {"status": "success"}
-
     if a == "list_locations":
         r = await c.get(f"{nl}?$top={top}")
         return {"count": len(r.get("value", [])), "locations": r.get("value", [])}
 
-    if a == "create_location":
-        return await c.post(nl, json=body or {})
-
-    if a == "update_location":
-        await c.patch(f"{nl}/{location_id}", json=body or {})
-        return {"status": "success"}
-
-    if a == "delete_location":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"{nl}/{location_id}")
-        return {"status": "success"}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 24 — Identity Protection & Authentication
@@ -2127,7 +1492,6 @@ async def manage_identity_protection(
     user_id: str = "",
     method_id: str = "",
     top: int = 50,
-    body: dict | None = None,
     filter_query: str = "",
 ) -> dict[str, Any]:
     """
@@ -2159,10 +1523,6 @@ async def manage_identity_protection(
     if a == "get_mfa_status":
         return await c.get(f"/reports/authenticationMethods/userRegistrationDetails/{user_id}", use_beta=True)
 
-    if a == "delete_auth_method":
-        await c.delete(f"/users/{user_id}/authentication/methods/{method_id}")
-        return {"status": "success"}
-
     if a == "get_auth_methods_policy":
         return await c.get("/policies/authenticationMethodsPolicy")
 
@@ -2188,14 +1548,7 @@ async def manage_identity_protection(
         r = await c.get(f"/identityProtection/riskDetections?$top={top}")
         return {"count": len(r.get("value", [])), "detections": r.get("value", [])}
 
-    if a == "dismiss_risky_user":
-        return await c.post("/identityProtection/riskyUsers/dismiss", json=body or {})
-
-    if a == "confirm_compromised":
-        return await c.post("/identityProtection/riskyUsers/confirmCompromised", json=body or {})
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 25 — App Registrations & Enterprise Apps
@@ -2207,9 +1560,7 @@ async def manage_app_registrations(
     sp_id: str = "",
     search_term: str = "",
     top: int = 50,
-    body: dict | None = None,
     days_until_expiry: int = 30,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only: view Entra ID app registrations and enterprise apps (service principals).
@@ -2245,13 +1596,6 @@ async def manage_app_registrations(
         r = await c.get(f"/applications?$filter=startswith(displayName,'{search_term}')&$top={top}")
         return {"count": len(r.get("value", [])), "registrations": r.get("value", [])}
 
-    if a == "delete_registration":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/applications/{app_id}")
-        return {"status": "success"}
-
     if a == "get_expiring_credentials":
         from datetime import datetime, timedelta, timezone
         cutoff = datetime.now(timezone.utc) + timedelta(days=days_until_expiry)
@@ -2280,16 +1624,7 @@ async def manage_app_registrations(
         oauth2 = await c.get(f"/servicePrincipals/{sp_id}/oauth2PermissionGrants")
         return {"appRoleAssignments": role_asgn.get("value", []), "oauth2PermissionGrants": oauth2.get("value", [])}
 
-    if a == "enable_enterprise_app":
-        await c.patch(f"/servicePrincipals/{sp_id}", json={"accountEnabled": True})
-        return {"status": "success"}
-
-    if a == "disable_enterprise_app":
-        await c.patch(f"/servicePrincipals/{sp_id}", json={"accountEnabled": False})
-        return {"status": "success"}
-
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 26 — Tenant Administration
@@ -2301,8 +1636,6 @@ async def manage_tenant_admin(
     member_id: str = "",
     agreement_id: str = "",
     top: int = 50,
-    body: dict | None = None,
-    confirm: bool = False,
 ) -> dict[str, Any]:
     """
     Read-only tenant information — org info, service health, directory roles, subscriptions, terms of use.
@@ -2372,17 +1705,6 @@ async def manage_tenant_admin(
         members = await c.get(f"/directoryRoles/{roles[0]['id']}/members")
         return {"count": len(members.get("value", [])), "members": members.get("value", [])}
 
-    if a == "assign_directory_role":
-        await c.post(f"/directoryRoles/{role_id}/members/$ref", json=body or {})
-        return {"status": "success"}
-
-    if a == "remove_directory_role_member":
-        guard = _require_confirm(a, confirm)
-        if guard:
-            return guard
-        await c.delete(f"/directoryRoles/{role_id}/members/{member_id}/$ref")
-        return {"status": "success"}
-
     if a == "get_subscriptions":
         r = await c.get("/subscribedSkus")
         return {"count": len(r.get("value", [])), "skus": r.get("value", [])}
@@ -2394,14 +1716,10 @@ async def manage_tenant_admin(
         r = await c.get(f"/agreements?$top={top}")
         return {"count": len(r.get("value", [])), "agreements": r.get("value", [])}
 
-    if a == "create_terms_of_use":
-        return await c.post("/agreements", json=body or {})
-
     if a == "get_cross_tenant_policy":
         return await c.get("/policies/crossTenantAccessPolicy")
 
     return {"error": f"Unknown action: {action}"}
-
 
 # ===========================================================================
 # TOOL 27 — Intune Reports & Analytics (read-only)
@@ -2530,7 +1848,6 @@ async def manage_intune_reports(
 
     return {"error": f"Unknown action: {action}"}
 
-
 # ===========================================================================
 # TOOL 28 — Discover Available Operations (Read-Only Catalog)
 # ===========================================================================
@@ -2563,7 +1880,6 @@ def _read_only_catalog() -> dict[str, dict[str, Any]]:
         "manage_windows_update": {"description": "Read Windows Update rings and profiles", "actions": ["list_update_rings", "get_update_ring", "list_feature_updates", "get_feature_update", "list_quality_updates", "list_driver_updates"]},
     }
 
-
 @_tool()
 async def discover_graph_operations(category: str = "") -> dict[str, Any]:
     """List all supported read-only Graph operations grouped by tool/domain."""
@@ -2591,7 +1907,6 @@ async def discover_graph_operations(category: str = "") -> dict[str, Any]:
             for name, info in catalog.items()
         },
     }
-
 
 if __name__ == "__main__":
     mcp.run()

@@ -9,6 +9,7 @@ from pathlib import Path
 import httpx
 from msal import ConfidentialClientApplication, PublicClientApplication, SerializableTokenCache
 
+from .auth import current_user
 from .config import get_config, GraphConfig
 
 _msal_executor = ThreadPoolExecutor(max_workers=2)
@@ -79,6 +80,9 @@ class GraphClient:
 
     async def _acquire_app_token(self) -> str:
         """Acquire app-only token using client credentials."""
+        if self.config.auth_mode == "obo":
+            raise RuntimeError("App-only token acquisition is disabled in OBO mode.")
+
         scopes = ["https://graph.microsoft.com/.default"]
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
@@ -93,6 +97,27 @@ class GraphClient:
         expires_in = result.get("expires_in", 3600)
         self._token_expires = datetime.now() + timedelta(seconds=expires_in - 300)
         return self._token
+
+    async def _acquire_obo_token(self) -> str:
+        """Exchange the current request's validated user token for a Graph token."""
+        user = current_user.get()
+        if user is None:
+            raise AuthRequiredError(
+                "A validated Copilot user token is required for Graph OBO access."
+            )
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _msal_executor,
+            lambda: self.msal_app.acquire_token_on_behalf_of(
+                user_assertion=user.access_token,
+                scopes=["https://graph.microsoft.com/.default"],
+            ),
+        )
+        if "access_token" not in result:
+            error = result.get("error_description", result.get("error", "Unknown error"))
+            raise PermissionError(f"Failed to acquire delegated Graph token: {error}")
+        return result["access_token"]
 
     async def _acquire_delegated_token_silent(self) -> str | None:
         """Try to get delegated token from cache without prompting user."""
@@ -197,6 +222,16 @@ class GraphClient:
 
     async def ensure_authenticated(self) -> dict[str, Any]:
         """Ensure the configured auth mode is authenticated and return a status payload."""
+        if self.config.auth_mode == "obo":
+            await self._acquire_obo_token()
+            user = current_user.get()
+            return {
+                "status": "authenticated",
+                "auth_mode": "obo",
+                "source": "copilot_user_token",
+                "user_id": user.claims["oid"] if user else None,
+            }
+
         if self.config.auth_mode == "app":
             await self._acquire_app_token()
             return {
@@ -275,6 +310,9 @@ class GraphClient:
 
     async def get_token(self) -> str:
         """Get a valid access token, refreshing if necessary."""
+        if self.config.auth_mode == "obo":
+            return await self._acquire_obo_token()
+
         if self._token and self._token_expires and datetime.now() < self._token_expires:
             return self._token
 
@@ -287,6 +325,16 @@ class GraphClient:
 
     async def get_auth_status(self) -> dict[str, Any]:
         """Return current auth mode and cached interactive sign-in status."""
+        if self.config.auth_mode == "obo":
+            user = current_user.get()
+            return {
+                "auth_mode": "obo",
+                "authentication_source": "copilot_oauth",
+                "current_user_id": user.claims.get("oid") if user else None,
+                "required_scope": self.config.mcp_api_scope,
+                "requires_copilot_sign_in": user is None,
+            }
+
         accounts = []
         if self.config.auth_mode in {"delegated", "hybrid"}:
             loop = asyncio.get_event_loop()
@@ -317,7 +365,14 @@ class GraphClient:
         _max_retries: int = 3,
         **kwargs
     ) -> dict[str, Any]:
-        """Make an authenticated request to Microsoft Graph with retry for transient failures."""
+        """Make a read request or submit the fixed Intune report-export job."""
+        normalized_endpoint = endpoint.lstrip("/")
+        if method == "POST":
+            if normalized_endpoint != "deviceManagement/reports/exportJobs" or not use_beta:
+                raise ValueError("Only the Intune report-export job POST is permitted.")
+        elif method != "GET":
+            raise ValueError("Graph client is read-only; only GET and report export are permitted.")
+
         base_url = self.config.beta_endpoint if use_beta else self.config.graph_endpoint
         url = f"{base_url}{endpoint}" if endpoint.startswith("/") else f"{base_url}/{endpoint}"
         extra_headers = kwargs.pop("headers", {})
@@ -327,9 +382,9 @@ class GraphClient:
             client = await self.get_http_client()
             
             headers = {
-                "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
                 **extra_headers,
+                "Authorization": f"******",
             }
             
             response = await client.request(method, url, headers=headers, **kwargs)
@@ -366,21 +421,14 @@ class GraphClient:
         """Make a GET request."""
         return await self._request("GET", endpoint, use_beta=use_beta, **kwargs)
     
-    async def post(self, endpoint: str, use_beta: bool = False, **kwargs) -> dict[str, Any]:
-        """Make a POST request."""
-        return await self._request("POST", endpoint, use_beta=use_beta, **kwargs)
-    
-    async def patch(self, endpoint: str, use_beta: bool = False, **kwargs) -> dict[str, Any]:
-        """Make a PATCH request."""
-        return await self._request("PATCH", endpoint, use_beta=use_beta, **kwargs)
-
-    async def put(self, endpoint: str, use_beta: bool = False, **kwargs) -> dict[str, Any]:
-        """Make a PUT request."""
-        return await self._request("PUT", endpoint, use_beta=use_beta, **kwargs)
-    
-    async def delete(self, endpoint: str, use_beta: bool = False, **kwargs) -> dict[str, Any]:
-        """Make a DELETE request."""
-        return await self._request("DELETE", endpoint, use_beta=use_beta, **kwargs)
+    async def create_report_export_job(self, **kwargs) -> dict[str, Any]:
+        """Request a report export; this does not mutate tenant configuration."""
+        return await self._request(
+            "POST",
+            "/deviceManagement/reports/exportJobs",
+            use_beta=True,
+            **kwargs,
+        )
     
     async def get_all_pages(
         self,
@@ -429,4 +477,3 @@ def get_graph_client() -> GraphClient:
     if _client is None:
         _client = GraphClient()
     return _client
-

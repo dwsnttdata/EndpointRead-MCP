@@ -24,6 +24,11 @@ Email : sujin.nelladath@nttdata.com
 EndpointRead-MCP enforces read-only behavior in tool action dispatch. Destructive
 operations such as create/update/delete/assign/restart/wipe are not available.
 If a blocked action is requested, the tool returns an error with allowed actions.
+Mutation branches and generic Graph write helpers are absent. Graph access uses
+GET requests, except report export: Microsoft Graph requires a POST to request a
+temporary export job, which reads and returns report data without changing
+directory or Intune configuration. The optional REST bridge also uses HTTP POST
+for read-query request bodies; its handlers invoke only read operations.
 
 ## Tool Catalog
 
@@ -107,12 +112,35 @@ TENANT_ID=<your-tenant-id>
 CLIENT_ID=<your-app-id>
 CLIENT_SECRET=<your-client-secret>
 
-AUTH_MODE=app
-REQUIRE_USER_LOGIN=false
-USER_AUTH_SCOPES=User.Read,DeviceManagementManagedDevices.Read.All
-INTERACTIVE_LOGIN_MODE=browser
-TOKEN_CACHE_PATH=.msal_token_cache.bin
+AUTH_MODE=obo
+MCP_API_AUDIENCE=api://<your-app-id>
+MCP_API_SCOPE=Mcp.Access
 ```
+
+In OBO mode, Copilot Studio authenticates each user and sends a delegated access
+token to the MCP HTTP endpoint. The server validates that token's signature,
+tenant, audience, and scope, then exchanges it for a Microsoft Graph token
+on behalf of that user. It does not fall back to application permissions.
+`CLIENT_SECRET` is the confidential-client credential used for the OBO exchange;
+it is not used to acquire an app-only Graph token in this mode.
+
+The default audience is `api://<CLIENT_ID>`. Set `MCP_API_AUDIENCE` to the
+Application ID URI configured under **Expose an API** if it differs. The default
+required MCP scope is `Mcp.Access`.
+
+The former `AUTH_MODE=app`, `delegated`, and `hybrid` implementations remain
+available in code for later use, but are not selected by this OBO configuration.
+OBO requires the authenticated Streamable HTTP endpoint and is not available
+over local stdio transport.
+
+For delegated Microsoft Graph calls, grant the application the required
+**Microsoft Graph delegated permissions** and admin consent where needed.
+Microsoft Graph still evaluates the signed-in user's permissions for each call.
+For Azure App Service, set `AUTH_MODE=obo`, `TENANT_ID`, `CLIENT_ID`,
+`CLIENT_SECRET`, `MCP_API_AUDIENCE`, and `MCP_API_SCOPE` in **Settings >
+Environment variables**, then restart the app. The startup command must serve
+`intune_mcp_server.mcp_app:app`, which applies the bearer-token validation
+middleware.
 
 ## Installation
 

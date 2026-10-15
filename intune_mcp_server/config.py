@@ -17,10 +17,12 @@ class GraphConfig:
     tenant_id: str
     client_id: str
     client_secret: str
-    auth_mode: str = "app"
+    auth_mode: str = "obo"
     require_user_login: bool = False
     interactive_login_mode: str = "device_code"
     user_auth_scopes: list[str] | None = None
+    mcp_api_audience: str = ""
+    mcp_api_scope: str = "Mcp.Access"
     token_cache_path: str = str(PROJECT_ROOT / ".msal_token_cache.bin")
     graph_endpoint: str = "https://graph.microsoft.com/v1.0"
     beta_endpoint: str = "https://graph.microsoft.com/beta"
@@ -33,9 +35,9 @@ class GraphConfig:
                 return default
             return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
-        auth_mode = (os.getenv("AUTH_MODE", "app") or "app").strip().lower()
-        if auth_mode not in {"app", "delegated", "hybrid"}:
-            raise ValueError("Invalid AUTH_MODE. Use one of: app, delegated, hybrid")
+        auth_mode = (os.getenv("AUTH_MODE", "obo") or "obo").strip().lower()
+        if auth_mode not in {"app", "delegated", "hybrid", "obo"}:
+            raise ValueError("Invalid AUTH_MODE. Use one of: obo, app, delegated, hybrid")
 
         require_user_login = _parse_bool(os.getenv("REQUIRE_USER_LOGIN"), default=False)
         interactive_login_mode = (os.getenv("INTERACTIVE_LOGIN_MODE", "device_code") or "device_code").strip().lower()
@@ -48,10 +50,11 @@ class GraphConfig:
         client_id = os.getenv("CLIENT_ID")
         client_secret = os.getenv("CLIENT_SECRET")
 
-        if auth_mode in {"app", "hybrid"} and not all([tenant_id, client_id, client_secret]):
+        if auth_mode in {"app", "hybrid", "obo"} and not all([tenant_id, client_id, client_secret]):
             raise ValueError(
                 "Missing required environment variables. "
-                "Please set TENANT_ID, CLIENT_ID, and CLIENT_SECRET in your .env file."
+                "Please set TENANT_ID, CLIENT_ID, and CLIENT_SECRET. "
+                "OBO also requires the app credential for its token exchange."
             )
         if auth_mode == "delegated" and not all([tenant_id, client_id]):
             raise ValueError(
@@ -67,6 +70,8 @@ class GraphConfig:
             require_user_login=require_user_login,
             interactive_login_mode=interactive_login_mode,
             user_auth_scopes=user_auth_scopes,
+            mcp_api_audience=os.getenv("MCP_API_AUDIENCE", f"api://{client_id or ''}").strip(),
+            mcp_api_scope=(os.getenv("MCP_API_SCOPE", "Mcp.Access") or "Mcp.Access").strip(),
             token_cache_path=os.getenv("TOKEN_CACHE_PATH", str(PROJECT_ROOT / ".msal_token_cache.bin")),
             graph_endpoint=os.getenv("GRAPH_ENDPOINT", "https://graph.microsoft.com/v1.0"),
             beta_endpoint=os.getenv("BETA_ENDPOINT", "https://graph.microsoft.com/beta"),
@@ -83,4 +88,3 @@ def get_config() -> GraphConfig:
     if _config is None:
         _config = GraphConfig.from_env()
     return _config
-
