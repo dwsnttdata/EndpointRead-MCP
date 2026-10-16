@@ -197,6 +197,24 @@ class GraphClientOBOTests(unittest.IsolatedAsyncioTestCase):
         msal_app.acquire_token_for_client.assert_not_called()
 
 
+class GraphClientRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sends_obo_graph_token_as_bearer_authorization(self):
+        graph_client = GraphClient(make_config())
+        graph_client.get_token = AsyncMock(return_value="graph-user-token")
+        response = MagicMock()
+        response.status_code = 200
+        response.text = '{"id": "user-id"}'
+        response.json.return_value = {"id": "user-id"}
+        client = MagicMock()
+        client.request = AsyncMock(return_value=response)
+        graph_client.get_http_client = AsyncMock(return_value=client)
+
+        await graph_client.get("me")
+
+        authorization = client.request.await_args.kwargs["headers"]["Authorization"]
+        self.assertEqual(authorization, "Bearer " + "graph-user-token")
+
+
 class GraphClientAuthDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_graph_401_logs_only_selected_headers_and_token_claims(self):
         graph_client = GraphClient(make_config())

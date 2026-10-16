@@ -419,7 +419,7 @@ class GraphClient:
             headers = {
                 "Content-Type": "application/json",
                 **extra_headers,
-                "Authorization": f"******",
+                "Authorization": "Bearer " + token,
             }
             
             response = await client.request(method, url, headers=headers, **kwargs)
