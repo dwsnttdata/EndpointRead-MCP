@@ -105,6 +105,37 @@ class EntraBearerAuthMiddlewareTests(unittest.IsolatedAsyncioTestCase):
         downstream.assert_not_called()
         verifier.verify.assert_not_called()
 
+    async def test_logs_rejection_reason_and_claims_without_token(self):
+        token = jwt.encode(
+            {"aud": "https://graph.microsoft.com", "scp": "User.Read", "tid": "tenant-id"},
+            "test-secret-value-long-enough-for-hs256",
+            algorithm="HS256",
+        )
+        verifier = MagicMock()
+        verifier.verify.side_effect = jwt.InvalidAudienceError("Audience doesn't match")
+        middleware = EntraBearerAuthMiddleware(MagicMock(), make_config(), verifier=verifier)
+        messages = []
+
+        async def send(message):
+            messages.append(message)
+
+        with self.assertLogs("intune_mcp_server.auth", level="WARNING") as logs:
+            await middleware(
+                {
+                    "type": "http",
+                    "path": "/mcp",
+                    "headers": [(b"authorization", f"Bearer {token}".encode())],
+                },
+                MagicMock(),
+                send,
+            )
+
+        output = "\n".join(logs.output)
+        self.assertEqual(messages[0]["status"], 401)
+        self.assertIn("InvalidAudienceError", output)
+        self.assertIn("https://graph.microsoft.com", output)
+        self.assertNotIn(token, output)
+
     async def test_can_protect_every_bridge_route(self):
         middleware = EntraBearerAuthMiddleware(
             MagicMock(),

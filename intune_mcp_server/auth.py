@@ -73,6 +73,26 @@ class EntraTokenVerifier:
         return AuthenticatedUser(access_token=access_token, claims=claims)
 
 
+_DIAGNOSTIC_CLAIMS = ("aud", "iss", "ver", "tid", "azp", "appid", "scp", "exp")
+
+
+def _log_rejection(path: str, reason: str, access_token: str | None = None) -> None:
+    """Log why a request was rejected without logging the token itself."""
+    claims: dict[str, Any] | str = "unavailable"
+    if access_token:
+        try:
+            unverified = jwt.decode(access_token, options={"verify_signature": False})
+            claims = {name: unverified.get(name) for name in _DIAGNOSTIC_CLAIMS}
+        except jwt.PyJWTError:
+            claims = "unreadable"
+    logger.warning(
+        "Rejected MCP request; path=%s reason=%s token_claims_unverified=%s",
+        path,
+        reason,
+        claims,
+    )
+
+
 class EntraBearerAuthMiddleware:
     """Require a validated delegated token for MCP HTTP requests."""
 
@@ -106,18 +126,28 @@ class EntraBearerAuthMiddleware:
             if name.lower() == b"authorization"
         ]
         if len(authorization_headers) != 1:
+            _log_rejection(
+                path,
+                f"expected one Authorization header, received {len(authorization_headers)}",
+            )
             await self._unauthorized(send)
             return
 
         authorization = authorization_headers[0].decode("latin-1")
         scheme, separator, access_token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not separator or not access_token.strip():
+            _log_rejection(path, "Authorization header is not a Bearer token")
             await self._unauthorized(send)
             return
 
         try:
             user = await asyncio.to_thread(self.verifier.verify, access_token.strip())
-        except jwt.InvalidTokenError:
+        except jwt.InvalidTokenError as exc:
+            _log_rejection(
+                path,
+                f"{type(exc).__name__}: {exc}",
+                access_token.strip(),
+            )
             await self._unauthorized(send)
             return
         except PyJWKClientError:
