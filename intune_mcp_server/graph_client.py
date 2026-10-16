@@ -1,18 +1,53 @@
 """Microsoft Graph API Client with authentication."""
 
 import asyncio
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 from pathlib import Path
 
 import httpx
+import jwt
 from msal import ConfidentialClientApplication, PublicClientApplication, SerializableTokenCache
 
 from .auth import current_user
 from .config import get_config, GraphConfig
 
 _msal_executor = ThreadPoolExecutor(max_workers=2)
+logger = logging.getLogger(__name__)
+
+
+def _log_graph_auth_failure(response: httpx.Response, access_token: str) -> None:
+    """Log selected Graph response headers and non-sensitive JWT metadata only."""
+    try:
+        claims = jwt.decode(
+            access_token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+        token_metadata = {
+            claim: claims[claim]
+            for claim in ("aud", "iss", "ver", "scp", "exp")
+            if claim in claims
+        }
+    except jwt.InvalidTokenError:
+        token_metadata = {"unavailable": "Graph access token is not a decodable JWT"}
+
+    response_metadata = {
+        name: response.headers[name]
+        for name in ("WWW-Authenticate", "request-id", "client-request-id", "Date")
+        if name in response.headers
+    }
+    logger.warning(
+        "Microsoft Graph returned HTTP 401; response_headers=%s token_claims_unverified=%s",
+        response_metadata,
+        token_metadata,
+    )
 
 
 class AuthRequiredError(Exception):
@@ -400,6 +435,8 @@ class GraphClient:
             return {"status": "success", "message": "Operation completed successfully"}
         
         if response.status_code >= 400:
+            if response.status_code == 401:
+                _log_graph_auth_failure(response, token)
             try:
                 error_data = response.json()
                 error_message = error_data.get("error", {}).get("message", response.text)

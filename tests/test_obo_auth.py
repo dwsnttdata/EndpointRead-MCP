@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import jwt
 
 from intune_mcp_server import server
@@ -194,6 +195,55 @@ class GraphClientOBOTests(unittest.IsolatedAsyncioTestCase):
             await graph_client.get_token()
 
         msal_app.acquire_token_for_client.assert_not_called()
+
+
+class GraphClientAuthDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_graph_401_logs_only_selected_headers_and_token_claims(self):
+        graph_client = GraphClient(make_config())
+        graph_token = jwt.encode(
+            {
+                "aud": "https://graph.microsoft.com",
+                "iss": "https://sts.windows.net/tenant-id/",
+                "ver": "1.0",
+                "scp": "User.Read",
+                "exp": 2_000_000_000,
+                "email": "private@example.com",
+            },
+            "test-signing-key-that-is-at-least-thirty-two-bytes",
+            algorithm="HS256",
+        )
+        graph_client.get_token = AsyncMock(return_value=graph_token)
+        response = MagicMock()
+        response.status_code = 401
+        response.headers = httpx.Headers(
+            {
+                "WWW-Authenticate": 'Bearer error="invalid_token"',
+                "request-id": "graph-request-id",
+                "client-request-id": "client-request-id",
+                "Date": "Thu, 16 Oct 2025 00:00:00 GMT",
+                "x-unrelated-header": "do-not-log",
+            }
+        )
+        response.json.return_value = {
+            "error": {"message": "Protocol 'Bearer' failed to validate."}
+        }
+        response.text = "response body"
+        client = MagicMock()
+        client.request = AsyncMock(return_value=response)
+        graph_client.get_http_client = AsyncMock(return_value=client)
+
+        with self.assertLogs("intune_mcp_server.graph_client", level="WARNING") as logs:
+            with self.assertRaisesRegex(Exception, "Graph API error \\(401\\)"):
+                await graph_client.get("users")
+
+        diagnostic_log = "\n".join(logs.output)
+        self.assertIn("graph-request-id", diagnostic_log)
+        self.assertIn("client-request-id", diagnostic_log)
+        self.assertIn("https://graph.microsoft.com", diagnostic_log)
+        self.assertIn("User.Read", diagnostic_log)
+        self.assertNotIn(graph_token, diagnostic_log)
+        self.assertNotIn("private@example.com", diagnostic_log)
+        self.assertNotIn("do-not-log", diagnostic_log)
 
 
 class GraphClientReadOnlyTests(unittest.IsolatedAsyncioTestCase):

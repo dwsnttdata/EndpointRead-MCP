@@ -142,6 +142,12 @@ Environment variables**, then restart the app. The startup command must serve
 `intune_mcp_server.mcp_app:app`, which applies the bearer-token validation
 middleware.
 
+If a tool call reaches the MCP but Microsoft Graph returns HTTP 401, the
+App Service log stream records only Graph's `WWW-Authenticate`, `request-id`,
+`client-request-id`, and `Date` headers, plus the Graph token's `aud`, `iss`,
+`ver`, `scp`, and `exp` claims. Those claims are decoded without signature
+verification for diagnostics only. Never log or share the access token itself.
+
 ## Installation
 
 ```powershell
